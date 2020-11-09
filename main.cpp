@@ -47,40 +47,50 @@ void sigusr1_handler(int s)
 /// [pause]
 }
 
+const int WIDTH = 1920; // 176;
+const int HEIGHT = 1080; //144;
+const int FRAME_BYTES = 3 * HEIGHT * WIDTH / 2;
 
-//void init_v4l() {
-//    int v4l2sink;
-//    int vidsendsiz;
-//
-//    v4l2sink = open("/dev/video0", O_WRONLY);
-//    if (v4l2sink < 0) {
-//        fprintf(stderr, "Failed to open v4l2sink device. (%s)\n", strerror(errno));
-//        return;
-//    }
-//    // setup video for proper format
-//    struct v4l2_format v;
-//    int t;
-//    v.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-//    t = ioctl(v4l2sink, VIDIOC_G_FMT, &v);
-//    if( t < 0 )
-//        exit(t);
-//    v.fmt.pix.width = 1920;
-//    v.fmt.pix.height = 1080;
-//    v.fmt.pix.pixelformat = V4L2_PIX_FMT_RGB24;
-//    vidsendsiz = width * height * 3;
-//    v.fmt.pix.sizeimage = vidsendsiz;
-//    t = ioctl(v4l2sink, VIDIOC_S_FMT, &v);
-//    if( t < 0 )
-//        exit(t);
-//
-//    auto vidsendbuf = malloc(vidsendsiz);
-//}
+struct ImageSize {
+    int width;
+    int height;
+};
 
-const int WIDTH = 1920;
-const int HEIGHT = 1080;
 
+
+ImageSize get_sensor_size(libfreenect2::Freenect2Device *dev){
+    ImageSize image_size{};
+
+
+}
+
+bool setup_v4l2loopback(int vid_fd){
+    struct v4l2_format vid_format{};
+
+    std::memset(&vid_format, 0, sizeof(vid_format));
+    vid_format.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+
+    if(ioctl(vid_fd, VIDIOC_G_FMT, &vid_format) == -1){
+        return false;
+    }
+    vid_format.fmt.pix.width = WIDTH;
+    vid_format.fmt.pix.height = HEIGHT;
+    vid_format.fmt.pix.pixelformat = V4L2_PIX_FMT_YUV420;
+    vid_format.fmt.pix.sizeimage = FRAME_BYTES;
+    vid_format.fmt.pix.field = V4L2_FIELD_NONE;
+
+    if(ioctl(vid_fd, VIDIOC_S_FMT, &vid_format) == -1){
+        return false;
+    }
+
+    return true;
+}
 
 int main() {
+
+    signal(SIGINT, sigint_handler);
+    signal(SIGTERM, sigint_handler);
+
     auto _log = libfreenect2::createConsoleLogger(libfreenect2::Logger::Debug);
     _log->log(_log->Info, "Logging setup done.");
     libfreenect2::Freenect2 kinect;
@@ -91,29 +101,12 @@ int main() {
 
     // setup v4l2loopback device
     int fd;
-    struct v4l2_format vid_format;
-    fd = open( "/dev/video2", O_RDWR);
+    fd = open( "/dev/video0", O_RDWR);
     if ( fd == -1){
         _log->log(_log->Error, "Can't open video device for writing");
         return 1;
     }
-    std::memset(&vid_format, 0, sizeof(vid_format));
-    vid_format.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-
-    if(ioctl(fd, VIDIOC_G_FMT, &vid_format) == -1){
-        _log->log(_log->Error, "Can't get vid format data");
-        return 1;
-    }
-    vid_format.fmt.pix.width = WIDTH;
-    vid_format.fmt.pix.height = HEIGHT;
-    vid_format.fmt.pix.pixelformat = V4L2_PIX_FMT_RGB24;
-    vid_format.fmt.pix.sizeimage = WIDTH * HEIGHT * 3;
-    vid_format.fmt.pix.field = V4L2_FIELD_NONE;
-
-    if(ioctl(fd, VIDIOC_S_FMT, &vid_format) == -1){
-        _log->log(_log->Error, "Can't set vid format");
-        return 1;
-    }
+    setup_v4l2loopback(fd);
 
     _log->log(_log->Info, "Video output device setup done.");
 
@@ -131,12 +124,15 @@ int main() {
     pipeline = new libfreenect2::CpuPacketPipeline();
     auto serial_number = kinect.getDefaultDeviceSerialNumber();
     dev = kinect.openDevice(serial_number, pipeline);
+    dev->getColorCameraParams();
     dev->setColorFrameListener(&listener);
     std::cout << "XXX: " << dev->getSerialNumber() << std::endl;
 
     dev->startStreams(true, false);
 
     cv::Mat cv_matrix;
+    cv::Mat new_mat;
+    cv::Size frame_size(WIDTH, HEIGHT);
     std::string filename;
     const int frames_per_second = 30;
     const int sleep_for = 1000 / frames_per_second;
@@ -145,14 +141,14 @@ int main() {
     img_param.push_back(100);
 
     // record length in seconds
-    int length = 60;
+    int length = 6;
 
     int max_count = frames_per_second * length;
     int frame_count = 0;
 
 
 
-    while (max_count > frame_count){
+    while (!protonect_shutdown){
         frame_count ++;
         _log->log(_log->Debug, "Waiting for frame " + std::to_string(frame_count));
         if (!listener.waitForNewFrame(frames, 2*1000)) {
@@ -168,10 +164,11 @@ int main() {
         filename = "/home/wish/frames/frame_" + std::to_string(frame_count) + ".jpg";
 
         cv_matrix = cv::Mat(rgb->height, rgb->width, CV_8UC4, rgb->data);
-        cv::cvtColor(cv_matrix, cv_matrix, cv::COLOR_RGB2XYZ);
+        cv::cvtColor(cv_matrix, cv_matrix, cv::COLOR_BGR2YUV_I420);
+//        cv::resize(cv_matrix, new_mat, frame_size);
         //cv::imwrite(filename, cv_matrix, img_param);
         _log->log(_log->Info, "Sending frame.... ");
-        write(fd, cv_matrix.data, WIDTH * HEIGHT * 3);
+        write(fd, cv_matrix.data, FRAME_BYTES);
         listener.release(frames);
         _log->log(_log->Debug, "Sleep");
         std::this_thread::sleep_for(std::chrono::milliseconds(sleep_for));

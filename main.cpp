@@ -1,9 +1,5 @@
-#include <stdio.h>
-#include <iostream>
 #include <unistd.h>
-#include <cstdlib>
 #include <signal.h>
-#include <chrono>
 #include <thread>
 #include <sys/ioctl.h>
 #include <linux/videodev2.h>
@@ -11,7 +7,6 @@
 /// [headers]
 #include <libfreenect2/libfreenect2.hpp>
 #include <libfreenect2/frame_listener_impl.h>
-#include <libfreenect2/registration.h>
 #include <libfreenect2/packet_pipeline.h>
 #include <libfreenect2/logger.h>
 #include <opencv2/opencv.hpp>
@@ -21,48 +16,35 @@
 
 bool protonect_shutdown = false; ///< Whether the running application should shut down.
 
-void sigint_handler(int s)
+void sig_handler(int s)
 {
     protonect_shutdown = true;
 }
 
-bool protonect_paused = false;
-libfreenect2::Freenect2Device *devtopause;
 
-//Doing non-trivial things in signal handler is bad. If you want to pause,
-//do it in another thread.
-//Though libusb operations are generally thread safe, I cannot guarantee
-//everything above is thread safe when calling start()/stop() while
-//waitForNewFrame().
-void sigusr1_handler(int s)
-{
-    if (devtopause == 0)
-        return;
-/// [pause]
-    if (protonect_paused)
-        devtopause->start();
-    else
-        devtopause->stop();
-    protonect_paused = !protonect_paused;
-/// [pause]
+libfreenect2::Logger * logger;
+
+void debug(const std::string& message){
+    logger->log(logger->Debug, message);
 }
 
-const int WIDTH = 1920; // 176;
-const int HEIGHT = 1080; //144;
-const int FRAME_BYTES = 3 * HEIGHT * WIDTH / 2;
+void info(const std::string& message){
+    logger->log(logger->Info, message);
+}
+
+void error(const std::string& message){
+    logger->log(logger->Error, message);
+}
 
 struct ImageSize {
-    int width;
-    int height;
-};
+    const int rgb_width = 1920;
+    const int rgb_height = 1080;
+    const int rgb_frame_size = 3 * rgb_height * rgb_width / 2;
+    const int depth_width = 512;
+    const int depth_height = 424;
+    const int pixel_byte = 4;
+} image_size;
 
-
-
-ImageSize get_sensor_size(libfreenect2::Freenect2Device *dev){
-    ImageSize image_size{};
-
-
-}
 
 bool setup_v4l2loopback(int vid_fd){
     struct v4l2_format vid_format{};
@@ -71,15 +53,17 @@ bool setup_v4l2loopback(int vid_fd){
     vid_format.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
 
     if(ioctl(vid_fd, VIDIOC_G_FMT, &vid_format) == -1){
+        error("IOCTL can't read from from video dev fd.");
         return false;
     }
-    vid_format.fmt.pix.width = WIDTH;
-    vid_format.fmt.pix.height = HEIGHT;
+    vid_format.fmt.pix.width = image_size.rgb_width;
+    vid_format.fmt.pix.height = image_size.rgb_height;
     vid_format.fmt.pix.pixelformat = V4L2_PIX_FMT_YUV420;
-    vid_format.fmt.pix.sizeimage = FRAME_BYTES;
+    vid_format.fmt.pix.sizeimage = image_size.rgb_frame_size;
     vid_format.fmt.pix.field = V4L2_FIELD_NONE;
 
     if(ioctl(vid_fd, VIDIOC_S_FMT, &vid_format) == -1){
+        error("IOCTL can't write to video dev fd.");
         return false;
     }
 
@@ -88,14 +72,15 @@ bool setup_v4l2loopback(int vid_fd){
 
 int main() {
 
-    signal(SIGINT, sigint_handler);
-    signal(SIGTERM, sigint_handler);
+    signal(SIGINT, sig_handler);
+    signal(SIGTERM, sig_handler);
 
-    auto _log = libfreenect2::createConsoleLogger(libfreenect2::Logger::Debug);
-    _log->log(_log->Info, "Logging setup done.");
+    logger = libfreenect2::createConsoleLogger(libfreenect2::Logger::Info);
+    info("Logging setup done.");
+
     libfreenect2::Freenect2 kinect;
     if (! kinect.enumerateDevices() > 0){
-        _log->log(_log->Error, "Kinect Device not found");
+        error("Kinect Device not found");
         return 1;
     }
 
@@ -103,14 +88,16 @@ int main() {
     int fd;
     fd = open( "/dev/video0", O_RDWR);
     if ( fd == -1){
-        _log->log(_log->Error, "Can't open video device for writing");
+        error("Can't open video device for writing");
         return 1;
     }
-    setup_v4l2loopback(fd);
+    if (!setup_v4l2loopback(fd)){
+        error("Can't setup videoloop back device");
+        return 1;
+    }
 
-    _log->log(_log->Info, "Video output device setup done.");
+    info("Video output device setup done.");
 
-    std::cout << kinect.getDefaultDeviceSerialNumber() << std::endl;
 
     libfreenect2::Freenect2Device *dev;
     libfreenect2::PacketPipeline *pipeline;
@@ -126,56 +113,41 @@ int main() {
     dev = kinect.openDevice(serial_number, pipeline);
     dev->getColorCameraParams();
     dev->setColorFrameListener(&listener);
-    std::cout << "XXX: " << dev->getSerialNumber() << std::endl;
-
-    dev->startStreams(true, false);
 
     cv::Mat cv_matrix;
     cv::Mat new_mat;
-    cv::Size frame_size(WIDTH, HEIGHT);
     std::string filename;
-    const int frames_per_second = 30;
-    const int sleep_for = 1000 / frames_per_second;
     std::vector<int> img_param;
     img_param.push_back(cv::ImwriteFlags::IMWRITE_JPEG_QUALITY);
     img_param.push_back(100);
-
-    // record length in seconds
-    int length = 6;
-
-    int max_count = frames_per_second * length;
     int frame_count = 0;
 
+    dev->startStreams(true, false);
 
-
+    info("Running, <ctrl-c> to exit.");
     while (!protonect_shutdown){
         frame_count ++;
-        _log->log(_log->Debug, "Waiting for frame " + std::to_string(frame_count));
+        debug("Waiting for frame " + std::to_string(frame_count));
         if (!listener.waitForNewFrame(frames, 2*1000)) {
-            _log->log(_log->Error, "FRAME TIMEOUT");
+            error("FRAME TIMEOUT");
             listener.release(frames);
             break;
         } else {
-            _log->log(_log->Info, "Got Frame :) " + std::to_string(frame_count));
+            debug("Got Frame :) " + std::to_string(frame_count));
         }
 
         libfreenect2::Frame *rgb = frames[libfreenect2::Frame::Color];
-
-        filename = "/home/wish/frames/frame_" + std::to_string(frame_count) + ".jpg";
-
         cv_matrix = cv::Mat(rgb->height, rgb->width, CV_8UC4, rgb->data);
+
+        // Loopback pixel format V4L2_PIX_FMT_YUV420 matches COLOR_BGR2YUV_I420
         cv::cvtColor(cv_matrix, cv_matrix, cv::COLOR_BGR2YUV_I420);
-//        cv::resize(cv_matrix, new_mat, frame_size);
-        //cv::imwrite(filename, cv_matrix, img_param);
-        _log->log(_log->Info, "Sending frame.... ");
-        write(fd, cv_matrix.data, FRAME_BYTES);
+
+        debug("Sending frame.... ");
+        write(fd, cv_matrix.data, image_size.rgb_frame_size);
         listener.release(frames);
-        _log->log(_log->Debug, "Sleep");
-        std::this_thread::sleep_for(std::chrono::milliseconds(sleep_for));
     }
 
     dev->stop();
     dev->close();
     return 0;
 }
-

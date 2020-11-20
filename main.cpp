@@ -138,7 +138,7 @@ int main() {
 
         libfreenect2::Frame *rgb = frames[libfreenect2::Frame::Color];
         cv_matrix = cv::Mat(rgb->height, rgb->width, CV_8UC4, rgb->data);
-
+        cv::flip(cv_matrix, cv_matrix, 1);
         // Loopback pixel format V4L2_PIX_FMT_YUV420 matches COLOR_BGR2YUV_I420
         cv::cvtColor(cv_matrix, cv_matrix, cv::COLOR_BGR2YUV_I420);
 
